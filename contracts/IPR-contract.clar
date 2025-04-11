@@ -106,6 +106,7 @@
   { creator: principal, index: uint }
   { asset-id: uint }
 )
+
 ;; Map to track creator asset count
 (define-map creator-asset-count
   { creator: principal }
@@ -212,6 +213,7 @@
     retains-royalties: bool ;; If the original creator still receives royalties
   }
 )
+
 ;; Dispute records
 (define-map disputes
   { dispute-id: uint }
@@ -346,113 +348,350 @@
 )
   (let
     (
-      (asset-id (var-get next-asset-id))
-      (creator-count (default-to { count: u0 } (map-get? creator-asset-count { creator: tx-sender })))
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
     )
     
-    ;; Validate asset type
-    (asserts! (<= asset-type ASSET-TYPE-OTHER) (err ERR-INVALID-PARAMETERS))
+    ;; Check if caller is current owner
+    (asserts! (is-eq tx-sender (get current-owner asset)) (err ERR-NOT-AUTHORIZED))
     
-    ;; Create the asset
+    ;; Check if already has beneficiary
+    (asserts! (is-none (get inheritance-beneficiary asset)) (err ERR-INHERITANCE-ALREADY-SET))
+    
+    ;; Update asset with beneficiary
     (map-set ip-assets
       { asset-id: asset-id }
-      {
-        title: title,
-        description: description,
-        asset-type: asset-type,
-        creator-principal: tx-sender,
-        creation-date: block-height,
-        registration-date: block-height,
-        content-hash: content-hash,
-        metadata-url: metadata-url,
-        license-count: u0,
-        is-transferable: is-transferable,
-        transfer-history: (list),
-        current-owner: tx-sender,
-        is-collaborative: false,
-        collaboration-id: none,
-        in-dispute: false,
-        dispute-id: none,
-        allowed-license-types: allowed-license-types,
-        inheritance-beneficiary: none
-      }
+      (merge asset {
+        inheritance-beneficiary: (some beneficiary)
+      })
     )
     
-    ;; Add to creator's assets
-    (map-set creator-assets
-      { creator: tx-sender, index: (get count creator-count) }
-      { asset-id: asset-id }
-    )
-    
-    ;; Update creator's asset count
-    (map-set creator-asset-count
-      { creator: tx-sender }
-      { count: (+ (get count creator-count) u1) }
-    )
-    
-    ;; Increment asset ID
-    (var-set next-asset-id (+ asset-id u1))
-    
-    (ok asset-id)
+    (ok true)
   )
 )
 
-;; Create a collaboration for an IP asset
-(define-public (create-collaboration
+;; Update inheritance beneficiary
+(define-public (update-inheritance-beneficiary (asset-id uint) (beneficiary principal))
+  (let
+    (
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+    )
+    
+    ;; Check if caller is current owner
+    (asserts! (is-eq tx-sender (get current-owner asset)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Update asset with beneficiary
+    (map-set ip-assets
+      { asset-id: asset-id }
+      (merge asset {
+        inheritance-beneficiary: (some beneficiary)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute inheritance transfer (would typically be triggered by a trusted oracle or authority)
+(define-public (execute-inheritance-transfer (asset-id uint))
+  (let
+    (
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (beneficiary (unwrap! (get inheritance-beneficiary asset) (err ERR-INVALID-TRANSFER)))
+    )
+    
+    ;; Only contract owner can execute inheritance transfers
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Create a transfer record
+    (let
+      (
+        (transfer-id (var-get next-transfer-id))
+      )
+      ;; Record the inheritance transfer
+      (map-set ip-transfers
+        { transfer-id: transfer-id }
+        {
+          asset-id: asset-id,
+          from-principal: (get current-owner asset),
+          to-principal: beneficiary,
+          transfer-price: u0,
+          transfer-date: (some block-height),
+          request-date: block-height,
+          status: TRANSFER-STATUS-COMPLETED,
+          transfer-terms: "Inheritance transfer",
+          requires-approval: false,
+          approved-by: (list),
+          transfer-hash: (sha256 (concat (unwrap-panic (to-consensus-buff? asset-id)) (unwrap-panic (to-consensus-buff? beneficiary)))),
+          retains-royalties: true
+        }
+      )
+      
+      ;; Update asset ownership
+      (map-set ip-assets
+        { asset-id: asset-id }
+        (merge asset {
+          current-owner: beneficiary,
+          transfer-history: (append (get transfer-history asset) transfer-id),
+          inheritance-beneficiary: none
+        })
+      )
+      
+      ;; Add to new owner's assets
+      (let
+        (
+          (new-owner-count (default-to { count: u0 } (map-get? creator-asset-count { creator: beneficiary })))
+        )
+        (map-set creator-assets
+          { creator: beneficiary, index: (get count new-owner-count) }
+          { asset-id: asset-id }
+        )
+        
+        (map-set creator-asset-count
+          { creator: beneficiary }
+          { count: (+ (get count new-owner-count) u1) }
+        )
+      )
+      
+      ;; Increment transfer ID
+      (var-set next-transfer-id (+ transfer-id u1))
+      
+      (ok transfer-id)
+    )
+  )
+)
+
+;; Raise a dispute
+(define-public (raise-dispute
   (asset-id uint)
-  (collaborators (list 10 principal))
-  (royalty-splits (list 10 { collaborator: principal, split-percent: uint }))
-  (decision-threshold uint)
-  (collaboration-terms (string-utf8 1000))
-  (agreement-hash (buff 32))
+  (related-license-id (optional uint))
+  (related-transfer-id (optional uint))
+  (raised-against principal)
+  (dispute-type (string-utf8 50))
+  (dispute-description (string-utf8 1000))
+  (evidence-hash (buff 32))
 )
   (let
     (
       (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
-      (collaboration-id (var-get next-collaboration-id))
+      (dispute-id (var-get next-dispute-id))
     )
     
-    ;; Check if caller is owner or original creator
-    (asserts! (is-eq tx-sender (get current-owner asset)) (err ERR-NOT-AUTHORIZED))
+    ;; Check if caller has a stake in the asset
+    (asserts! (or
+               (is-eq tx-sender (get current-owner asset))
+               (is-eq tx-sender (get creator-principal asset))
+               (is-collaborator asset-id tx-sender)
+              )
+              (err ERR-NOT-AUTHORIZED))
     
-    ;; Ensure asset is not already collaborative
-    (asserts! (not (get is-collaborative asset)) (err ERR-ALREADY-COLLABORATOR))
-    
-    ;; Validate collaborator list includes the creator
-    (asserts! (is-some (index-of collaborators tx-sender)) (err ERR-INVALID-PARAMETERS))
-    
-    ;; Validate royalty splits add up to 100%
-    (asserts! (is-eq (fold add-royalty-percent royalty-splits u0) u10000) (err ERR-INVALID-PARAMETERS))
-    
-    ;; Create collaboration
-    (map-set collaborations
-      { collaboration-id: collaboration-id }
+    ;; Create dispute
+    (map-set disputes
+      { dispute-id: dispute-id }
       {
         asset-id: asset-id,
+        related-license-id: related-license-id,
+        related-transfer-id: related-transfer-id,
+        raised-by: tx-sender,
+        raised-against: raised-against,
+        dispute-type: dispute-type,
+        dispute-description: dispute-description,
+        evidence-hash: evidence-hash,
+        status: DISPUTE-STATUS-OPEN,
         creation-date: block-height,
-        last-modified: block-height,
-        collaborators: collaborators,
-        royalty-splits: royalty-splits,
-        decision-threshold: decision-threshold,
-        collaboration-terms: collaboration-terms,
-        agreement-hash: agreement-hash,
-        administrator: tx-sender,
-        is-active: true
+        resolution-date: none,
+        resolution-notes: none,
+        arbiter: none
       }
     )
     
-    ;; Update asset to mark as collaborative
+    ;; Update asset to mark as in dispute
     (map-set ip-assets
       { asset-id: asset-id }
       (merge asset {
-        is-collaborative: true,
-        collaboration-id: (some collaboration-id)
+        in-dispute: true,
+        dispute-id: (some dispute-id)
       })
     )
     
-    ;; Increment collaboration ID
-    (var-set next-collaboration-id (+ collaboration-id u1))
+    ;; If dispute is about a license, update license status
+    (match related-license-id
+      license-id
+      (match (get-license license-id)
+        license
+        (map-set licenses
+          { license-id: license-id }
+          (merge license {
+            status: LICENSE-STATUS-DISPUTE
+          })
+        )
+        true
+      )
+      true
+    )
     
-    (ok collaboration-id)
+    ;; If dispute is about a transfer, update transfer status
+    (match related-transfer-id
+      transfer-id
+      (match (get-transfer transfer-id)
+        transfer
+        (map-set ip-transfers
+          { transfer-id: transfer-id }
+          (merge transfer {
+            status: TRANSFER-STATUS-DISPUTED
+          })
+        )
+        true
+      )
+      true
+    )
+    
+    ;; Increment dispute ID
+    (var-set next-dispute-id (+ dispute-id u1))
+    
+    (ok dispute-id)
   )
 )
+
+;; Assign arbiter to a dispute
+(define-public (assign-arbiter (dispute-id uint) (arbiter-principal principal))
+  (let
+    (
+      (dispute (unwrap! (get-dispute dispute-id) (err ERR-DISPUTE-NOT-FOUND)))
+    )
+    
+    ;; Only contract owner can assign arbiters
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if dispute is open
+    (asserts! (is-eq (get status dispute) DISPUTE-STATUS-OPEN) (err ERR-DISPUTE-ALREADY-RESOLVED))
+    
+    ;; Update dispute
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        status: DISPUTE-STATUS-ARBITRATION,
+        arbiter: (some arbiter-principal)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Resolve a dispute
+(define-public (resolve-dispute
+  (dispute-id uint)
+  (resolution-notes (string-utf8 1000))
+)
+  (let
+    (
+      (dispute (unwrap! (get-dispute dispute-id) (err ERR-DISPUTE-NOT-FOUND)))
+      (asset-id (get asset-id dispute))
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+    )
+    
+    ;; Check if caller is assigned arbiter or contract owner
+    (asserts! (or
+               (is-eq tx-sender (var-get contract-owner))
+               (is-eq (some tx-sender) (get arbiter dispute))
+              )
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if dispute is not already resolved
+    (asserts! (not (is-eq (get status dispute) DISPUTE-STATUS-RESOLVED)) (err ERR-DISPUTE-ALREADY-RESOLVED))
+    
+    ;; Update dispute status
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        status: DISPUTE-STATUS-RESOLVED,
+        resolution-date: (some block-height),
+        resolution-notes: (some resolution-notes)
+      })
+    )
+    
+    ;; Update asset to remove dispute flag
+    (map-set ip-assets
+      { asset-id: asset-id }
+      (merge asset {
+        in-dispute: false,
+        dispute-id: none
+      })
+    )
+    
+    ;; If dispute involved a license, update license status based on resolution
+    (match (get related-license-id dispute)
+      license-id
+      (match (get-license license-id)
+        license
+        (map-set licenses
+          { license-id: license-id }
+          (merge license {
+            status: LICENSE-STATUS-ACTIVE ;; Or other status based on resolution
+          })
+        )
+        true
+      )
+      true
+    )
+    
+    ;; If dispute involved a transfer, update transfer status based on resolution
+    (match (get related-transfer-id dispute)
+      transfer-id
+      (match (get-transfer transfer-id)
+        transfer
+        (map-set ip-transfers
+          { transfer-id: transfer-id }
+          (merge transfer {
+            status: TRANSFER-STATUS-PENDING ;; Or other status based on resolution
+          })
+        )
+        true
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+;; Use a license (increment usage count and verify license is valid)
+(define-public (use-license (license-id uint))
+  (let
+    (
+      (license (unwrap! (get-license license-id) (err ERR-LICENSE-NOT-FOUND)))
+    )
+    
+    ;; Check if caller is the licensee
+    (asserts! (is-eq tx-sender (get licensee license)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if license is active
+    (asserts! (is-license-active license-id) (err ERR-LICENSE-NOT-ACTIVE))
+    
+    ;; Check if usage is within limits
+    (match (get usage-limits license)
+      limits (asserts! (< (get usage-count license) limits) (err ERR-LICENSE-EXPIRED))
+      true
+    )
+    
+    ;; Update usage count
+    (map-set licenses
+      { license-id: license-id }
+      (merge license {
+        usage-count: (+ (get usage-count license) u1),
+        last-modified: block-height
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Terminate a license
+(define-public (terminate-license (license-id uint))
+  (let
+    (
+      (license (unwrap! (get-license license-id) (err ERR-LICENSE-NOT-FOUND)))
+      (asset-id (get asset-id license))
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+    )
