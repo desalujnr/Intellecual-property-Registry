@@ -106,3 +106,109 @@
   { creator: principal, index: uint }
   { asset-id: uint }
 )
+;; Map to track creator asset count
+(define-map creator-asset-count
+  { creator: principal }
+  { count: uint }
+)
+
+;; Collaboration agreements
+(define-map collaborations
+  { collaboration-id: uint }
+  {
+    asset-id: uint,
+    creation-date: uint,
+    last-modified: uint,
+    collaborators: (list 10 principal),
+    royalty-splits: (list 10 { collaborator: principal, split-percent: uint }),
+    decision-threshold: uint, ;; Percentage required for decisions as basis points
+    collaboration-terms: (string-utf8 1000),
+    agreement-hash: (buff 32),
+    administrator: principal,
+    is-active: bool
+  }
+)
+
+;; Licensing agreements
+(define-map licenses
+  { license-id: uint }
+  {
+    asset-id: uint,
+    licensor: principal,
+    licensee: principal,
+    license-type: uint,
+    license-terms: (string-utf8 1000),
+    royalty-percent: uint, ;; Basis points
+    upfront-payment: uint,
+    start-date: uint,
+    end-date: (optional uint),
+    territory: (string-utf8 100),
+    usage-limits: (optional uint),
+    usage-count: uint,
+    payment-schedule: (string-utf8 256),
+    status: uint,
+    creation-date: uint,
+    last-modified: uint,
+    license-hash: (buff 32),
+    is-sublicensable: bool,
+    sublicense-parent: (optional uint),
+    termination-conditions: (string-utf8 500)
+  }
+)
+
+;; Map of licenses by asset
+(define-map asset-licenses
+  { asset-id: uint, index: uint }
+  { license-id: uint }
+)
+
+;; Map of licenses by licensee
+(define-map licensee-licenses
+  { licensee: principal, index: uint }
+  { license-id: uint }
+)
+
+;; Map to track license counts for a licensee
+(define-map licensee-license-count
+  { licensee: principal }
+  { count: uint }
+)
+
+;; Royalty payments
+(define-map royalty-payments
+  { license-id: uint, payment-index: uint }
+  {
+    amount: uint,
+    payment-date: uint,
+    payment-period-start: uint,
+    payment-period-end: uint,
+    paid-by: principal,
+    received-by: principal,
+    transaction-id: (buff 32)
+  }
+)
+
+;; Map to track royalty payment counts
+(define-map royalty-payment-count
+  { license-id: uint }
+  { count: uint }
+)
+
+;; IP Transfers
+(define-map ip-transfers
+  { transfer-id: uint }
+  {
+    asset-id: uint,
+    from-principal: principal,
+    to-principal: principal,
+    transfer-price: uint,
+    transfer-date: (optional uint),
+    request-date: uint,
+    status: uint,
+    transfer-terms: (string-utf8 500),
+    requires-approval: bool,
+    approved-by: (list 10 principal), ;; For collaborative assets
+    transfer-hash: (buff 32),
+    retains-royalties: bool ;; If the original creator still receives royalties
+  }
+)
