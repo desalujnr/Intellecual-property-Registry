@@ -941,3 +941,442 @@
     (ok asset-id)
   )
 )
+;; Create a collaboration for an IP asset
+(define-public (create-collaboration
+  (asset-id uint)
+  (collaborators (list 10 principal))
+  (royalty-splits (list 10 { collaborator: principal, split-percent: uint }))
+  (decision-threshold uint)
+  (collaboration-terms (string-utf8 1000))
+  (agreement-hash (buff 32))
+)
+  (let
+    (
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (collaboration-id (var-get next-collaboration-id))
+    )
+    
+    ;; Check if caller is owner or original creator
+    (asserts! (is-eq tx-sender (get current-owner asset)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Ensure asset is not already collaborative
+    (asserts! (not (get is-collaborative asset)) (err ERR-ALREADY-COLLABORATOR))
+    
+    ;; Validate collaborator list includes the creator
+    (asserts! (is-some (index-of collaborators tx-sender)) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Validate royalty splits add up to 100%
+    (asserts! (is-eq (fold add-royalty-percent royalty-splits u0) u10000) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Create collaboration
+    (map-set collaborations
+      { collaboration-id: collaboration-id }
+      {
+        asset-id: asset-id,
+        creation-date: block-height,
+        last-modified: block-height,
+        collaborators: collaborators,
+        royalty-splits: royalty-splits,
+        decision-threshold: decision-threshold,
+        collaboration-terms: collaboration-terms,
+        agreement-hash: agreement-hash,
+        administrator: tx-sender,
+        is-active: true
+      }
+    )
+    
+    ;; Update asset to mark as collaborative
+    (map-set ip-assets
+      { asset-id: asset-id }
+      (merge asset {
+        is-collaborative: true,
+        collaboration-id: (some collaboration-id)
+      })
+    )
+    
+    ;; Increment collaboration ID
+    (var-set next-collaboration-id (+ collaboration-id u1))
+    
+    (ok collaboration-id)
+  )
+)
+
+;; Helper function to add royalty percentages
+(define-private (add-royalty-percent (royalty-split { collaborator: principal, split-percent: uint }) (total uint))
+  (+ total (get split-percent royalty-split))
+)
+
+;; Create a new license
+(define-public (create-license
+  (asset-id uint)
+  (licensee principal)
+  (license-type uint)
+  (license-terms (string-utf8 1000))
+  (royalty-percent uint)
+  (upfront-payment uint)
+  (start-date uint)
+  (end-date (optional uint))
+  (territory (string-utf8 100))
+  (usage-limits (optional uint))
+  (payment-schedule (string-utf8 256))
+  (license-hash (buff 32))
+  (is-sublicensable bool)
+  (termination-conditions (string-utf8 500))
+)
+  (let
+    (
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (license-id (var-get next-license-id))
+    )
+    
+    ;; Check if caller is current owner
+    (asserts! (is-eq tx-sender (get current-owner asset)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; If collaborative, check if caller is a collaborator
+    (when (get is-collaborative asset)
+      (asserts! (is-collaborator asset-id tx-sender) (err ERR-NOT-AUTHORIZED))
+    )
+    
+    ;; Check if license type is allowed
+    (asserts! (is-some (index-of (get allowed-license-types asset) license-type)) (err ERR-INVALID-LICENSE-TERMS))
+    
+    ;; Check if royalty percentage is within limits
+    (asserts! (<= royalty-percent (var-get max-royalty-percent)) (err ERR-ROYALTY-EXCEEDS-MAX))
+    
+    ;; Process upfront payment if any
+    (when (> upfront-payment u0)
+      (try! (stx-transfer? upfront-payment licensee tx-sender))
+    )
+    
+    ;; Create the license
+    (map-set licenses
+      { license-id: license-id }
+      {
+        asset-id: asset-id,
+        licensor: tx-sender,
+        licensee: licensee,
+        license-type: license-type,
+        license-terms: license-terms,
+        royalty-percent: royalty-percent,
+        upfront-payment: upfront-payment,
+        start-date: start-date,
+        end-date: end-date,
+        territory: territory,
+        usage-limits: usage-limits,
+        usage-count: u0,
+        payment-schedule: payment-schedule,
+        status: LICENSE-STATUS-ACTIVE,
+        creation-date: block-height,
+        last-modified: block-height,
+        license-hash: license-hash,
+        is-sublicensable: is-sublicensable,
+        sublicense-parent: none,
+        termination-conditions: termination-conditions
+      }
+    )
+    
+    ;; Add to asset's licenses
+    (map-set asset-licenses
+      { asset-id: asset-id, index: (get license-count asset) }
+      { license-id: license-id }
+    )
+    
+    ;; Update asset license count
+    (map-set ip-assets
+      { asset-id: asset-id }
+      (merge asset {
+        license-count: (+ (get license-count asset) u1)
+      })
+    )
+    
+    ;; Add to licensee's licenses
+    (let
+      (
+        (licensee-count (default-to { count: u0 } (map-get? licensee-license-count { licensee: licensee })))
+      )
+      (map-set licensee-licenses
+        { licensee: licensee, index: (get count licensee-count) }
+        { license-id: license-id }
+      )
+      
+      (map-set licensee-license-count
+        { licensee: licensee }
+        { count: (+ (get count licensee-count) u1) }
+      )
+    )
+    
+    ;; Initialize royalty payment count
+    (map-set royalty-payment-count
+      { license-id: license-id }
+      { count: u0 }
+    )
+    
+    ;; Increment license ID
+    (var-set next-license-id (+ license-id u1))
+    
+    (ok license-id)
+  )
+)
+
+;; Record a royalty payment
+(define-public (record-royalty-payment
+  (license-id uint)
+  (amount uint)
+  (payment-period-start uint)
+  (payment-period-end uint)
+  (transaction-id (buff 32))
+)
+  (let
+    (
+      (license (unwrap! (get-license license-id) (err ERR-LICENSE-NOT-FOUND)))
+      (payment-count (default-to { count: u0 } (map-get? royalty-payment-count { license-id: license-id })))
+      (asset-id (get asset-id license))
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+    )
+    
+    ;; Check if license is active
+    (asserts! (is-license-active license-id) (err ERR-LICENSE-NOT-ACTIVE))
+    
+    ;; Check if caller is the licensee
+    (asserts! (is-eq tx-sender (get licensee license)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Calculate platform fee
+    (let
+      (
+        (platform-fee (/ (* amount (var-get platform-fee-percent)) u10000))
+        (royalty-amount (- amount platform-fee))
+        (owner (get current-owner asset))
+      )
+      
+      ;; Pay platform fee to contract owner
+      (try! (stx-transfer? platform-fee tx-sender (var-get contract-owner)))
+      
+      ;; Handle royalty payment to owner(s)
+      (if (get is-collaborative asset)
+        ;; Handle collaborative asset royalties
+        (try! (distribute-collaborative-royalties license-id royalty-amount))
+        
+        ;; Pay single owner
+        (try! (stx-transfer? royalty-amount tx-sender owner))
+      )
+      
+      ;; Record the payment
+      (map-set royalty-payments
+        { license-id: license-id, payment-index: (get count payment-count) }
+        {
+          amount: amount,
+          payment-date: block-height,
+          payment-period-start: payment-period-start,
+          payment-period-end: payment-period-end,
+          paid-by: tx-sender,
+          received-by: owner,
+          transaction-id: transaction-id
+        }
+      )
+      
+      ;; Update payment count
+      (map-set royalty-payment-count
+        { license-id: license-id }
+        { count: (+ (get count payment-count) u1) }
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Helper to distribute royalties for collaborative assets
+(define-private (distribute-collaborative-royalties (license-id uint) (amount uint))
+  (let
+    (
+      (license (unwrap! (get-license license-id) (err ERR-LICENSE-NOT-FOUND)))
+      (asset-id (get asset-id license))
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (royalty-distribution (unwrap! (calculate-royalty-distribution license-id amount) (err ERR-INVALID-PARAMETERS)))
+    )
+    
+    ;; Distribute to each collaborator
+    (map distribute-royalty-share (merge-lists royalty-distribution (list amount tx-sender)))
+    
+    (ok true)
+  )
+)
+
+;; Helper to distribute royalty share
+(define-private (distribute-royalty-share (distribution { collaborator: principal, split-percent: uint, amount: uint, sender: principal }))
+  (let
+    (
+      (share-amount (/ (* (get amount distribution) (get split-percent distribution)) u10000))
+    )
+    (stx-transfer? share-amount (get sender distribution) (get collaborator distribution))
+  )
+)
+
+;; Helper to merge royalty splits with amount and sender
+(define-private (merge-lists (splits (list 10 { collaborator: principal, split-percent: uint })) (values (list amount uint, sender principal)))
+  (map merge-with-values splits (get amount values) (get sender values))
+)
+
+;; Helper to merge royalty split with amount and sender
+(define-private (merge-with-values (split { collaborator: principal, split-percent: uint }) (amount uint) (sender principal))
+  (merge split { amount: amount, sender: sender })
+)
+
+;; Request IP transfer
+(define-public (request-ip-transfer
+  (asset-id uint)
+  (to-principal principal)
+  (transfer-price uint)
+  (transfer-terms (string-utf8 500))
+  (transfer-hash (buff 32))
+  (retains-royalties bool)
+)
+  (let
+    (
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (transfer-id (var-get next-transfer-id))
+    )
+    
+    ;; Check if caller is current owner
+    (asserts! (is-eq tx-sender (get current-owner asset)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if asset is transferable
+    (asserts! (get is-transferable asset) (err ERR-INVALID-TRANSFER))
+    
+    ;; Check if asset is in dispute
+    (asserts! (not (get in-dispute asset)) (err ERR-DISPUTE-PENDING))
+    
+    ;; Create transfer request
+    (map-set ip-transfers
+      { transfer-id: transfer-id }
+      {
+        asset-id: asset-id,
+        from-principal: tx-sender,
+        to-principal: to-principal,
+        transfer-price: transfer-price,
+        transfer-date: none,
+        request-date: block-height,
+        status: TRANSFER-STATUS-PENDING,
+        transfer-terms: transfer-terms,
+        requires-approval: (get is-collaborative asset),
+        approved-by: (if (get is-collaborative asset) (list tx-sender) (list)),
+        transfer-hash: transfer-hash,
+        retains-royalties: retains-royalties
+      }
+    )
+    
+    ;; Increment transfer ID
+    (var-set next-transfer-id (+ transfer-id u1))
+    
+    (ok transfer-id)
+  )
+)
+
+;; Approve collaborative transfer
+(define-public (approve-transfer (transfer-id uint))
+  (let
+    (
+      (transfer (unwrap! (get-transfer transfer-id) (err ERR-TRANSFER-NOT-FOUND)))
+      (asset-id (get asset-id transfer))
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+    )
+    
+    ;; Check if asset is collaborative
+    (asserts! (get is-collaborative asset) (err ERR-NOT-COLLABORATIVE))
+    
+    ;; Check if caller is a collaborator
+    (asserts! (is-collaborator asset-id tx-sender) (err ERR-NOT-COLLABORATOR))
+    
+    ;; Check if transfer is pending
+    (asserts! (is-eq (get status transfer) TRANSFER-STATUS-PENDING) (err ERR-INVALID-TRANSFER))
+    
+    ;; Check if caller hasn't already approved
+    (asserts! (is-none (index-of (get approved-by transfer) tx-sender)) (err ERR-ALREADY-CONFIRMED))
+    
+    ;; Add caller to approved list
+    (map-set ip-transfers
+      { transfer-id: transfer-id }
+      (merge transfer {
+        approved-by: (append (get approved-by transfer) tx-sender)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Complete IP transfer
+(define-public (complete-ip-transfer (transfer-id uint))
+  (let
+    (
+      (transfer (unwrap! (get-transfer transfer-id) (err ERR-TRANSFER-NOT-FOUND)))
+      (asset-id (get asset-id transfer))
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (from-principal (get from-principal transfer))
+      (to-principal (get to-principal transfer))
+      (transfer-price (get transfer-price transfer))
+    )
+    
+    ;; Check if transfer is pending
+    (asserts! (is-eq (get status transfer) TRANSFER-STATUS-PENDING) (err ERR-INVALID-TRANSFER))
+    
+    ;; If collaborative, check if enough approvals
+    (when (get is-collaborative asset)
+      (match (get collaboration-id asset)
+        collaboration-id
+        (let
+          (
+            (collaboration (unwrap! (get-collaboration collaboration-id) (err ERR-COLLABORATION-NOT-FOUND)))
+            (approval-count (len (get approved-by transfer)))
+            (total-collaborators (len (get collaborators collaboration)))
+            (required-approvals (/ (* total-collaborators (get decision-threshold collaboration)) u10000))
+          )
+          ;; Check if enough approvals
+          (asserts! (>= approval-count required-approvals) (err ERR-NOT-AUTHORIZED))
+        )
+        (err ERR-COLLABORATION-NOT-FOUND)
+      )
+    )
+    
+    ;; Process payment
+    (when (> transfer-price u0)
+      (try! (stx-transfer? transfer-price to-principal from-principal))
+    )
+    
+    ;; Update transfer status
+    (map-set ip-transfers
+      { transfer-id: transfer-id }
+      (merge transfer {
+        status: TRANSFER-STATUS-COMPLETED,
+        transfer-date: (some block-height)
+      })
+    )
+    
+    ;; Update asset ownership
+    (map-set ip-assets
+      { asset-id: asset-id }
+      (merge asset {
+        current-owner: to-principal,
+        transfer-history: (append (get transfer-history asset) transfer-id)
+      })
+    )
+    
+    ;; Add to new owner's assets
+    (let
+      (
+        (new-owner-count (default-to { count: u0 } (map-get? creator-asset-count { creator: to-principal })))
+      )
+      (map-set creator-assets
+        { creator: to-principal, index: (get count new-owner-count) }
+        { asset-id: asset-id }
+      )
+      
+      (map-set creator-asset-count
+        { creator: to-principal }
+        { count: (+ (get count new-owner-count) u1) }
+      )
+    )
+    
+    (ok true)
+  )
+)
