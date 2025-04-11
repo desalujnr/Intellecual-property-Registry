@@ -212,3 +212,247 @@
     retains-royalties: bool ;; If the original creator still receives royalties
   }
 )
+;; Dispute records
+(define-map disputes
+  { dispute-id: uint }
+  {
+    asset-id: uint,
+    related-license-id: (optional uint),
+    related-transfer-id: (optional uint),
+    raised-by: principal,
+    raised-against: principal,
+    dispute-type: (string-utf8 50),
+    dispute-description: (string-utf8 1000),
+    evidence-hash: (buff 32),
+    status: uint,
+    creation-date: uint,
+    resolution-date: (optional uint),
+    resolution-notes: (optional (string-utf8 1000)),
+    arbiter: (optional principal)
+  }
+)
+
+;; Read-only functions
+
+;; Get IP asset details
+(define-read-only (get-ip-asset (asset-id uint))
+  (map-get? ip-assets { asset-id: asset-id })
+)
+
+;; Get collaboration details
+(define-read-only (get-collaboration (collaboration-id uint))
+  (map-get? collaborations { collaboration-id: collaboration-id })
+)
+
+;; Get license details
+(define-read-only (get-license (license-id uint))
+  (map-get? licenses { license-id: license-id })
+)
+
+;; Get transfer details
+(define-read-only (get-transfer (transfer-id uint))
+  (map-get? ip-transfers { transfer-id: transfer-id })
+)
+
+;; Get dispute details
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+;; Check if license is active
+(define-read-only (is-license-active (license-id uint))
+  (match (get-license license-id)
+    license
+    (let
+      (
+        (status (get status license))
+        (current-block block-height)
+        (license-expired
+          (match (get end-date license)
+            end-date (>= current-block end-date)
+            false
+          )
+        )
+      )
+      (and
+        (is-eq status LICENSE-STATUS-ACTIVE)
+        (not license-expired)
+        (or
+          (is-none (get usage-limits license))
+          (< (get usage-count license) (default-to u0 (get usage-limits license)))
+        )
+      )
+    )
+    false
+  )
+)
+
+;; Check if principal is a collaborator
+(define-read-only (is-collaborator (asset-id uint) (user principal))
+  (match (get-ip-asset asset-id)
+    asset
+    (match (get collaboration-id asset)
+      collab-id
+      (match (get-collaboration collab-id)
+        collaboration
+        (default-to false (some (is-some (index-of (get collaborators collaboration) user))))
+        false
+      )
+      false
+    )
+    false
+  )
+)
+
+;; Calculate royalty distribution for a payment
+(define-read-only (calculate-royalty-distribution (license-id uint) (payment-amount uint))
+  (match (get-license license-id)
+    license
+    (let
+      (
+        (asset-id (get asset-id license))
+        (asset (unwrap! (get-ip-asset asset-id) (err "Asset not found")))
+      )
+      (if (get is-collaborative asset)
+        ;; Handle collaborative asset
+        (match (get collaboration-id asset)
+          collaboration-id
+          (match (get-collaboration collaboration-id)
+            collaboration
+            (ok (get royalty-splits collaboration))
+            (err "Collaboration not found")
+          )
+          (err "Collaboration ID not found")
+        )
+        ;; Single creator - return 100% to owner
+        (ok (list { collaborator: (get current-owner asset), split-percent: u10000 }))
+      )
+    )
+    (err "License not found")
+  )
+)
+
+;; Public functions
+
+;; Register a new IP asset
+(define-public (register-ip-asset
+  (title (string-utf8 100))
+  (description (string-utf8 1000))
+  (asset-type uint)
+  (content-hash (buff 32))
+  (metadata-url (string-utf8 256))
+  (is-transferable bool)
+  (allowed-license-types (list 10 uint))
+)
+  (let
+    (
+      (asset-id (var-get next-asset-id))
+      (creator-count (default-to { count: u0 } (map-get? creator-asset-count { creator: tx-sender })))
+    )
+    
+    ;; Validate asset type
+    (asserts! (<= asset-type ASSET-TYPE-OTHER) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Create the asset
+    (map-set ip-assets
+      { asset-id: asset-id }
+      {
+        title: title,
+        description: description,
+        asset-type: asset-type,
+        creator-principal: tx-sender,
+        creation-date: block-height,
+        registration-date: block-height,
+        content-hash: content-hash,
+        metadata-url: metadata-url,
+        license-count: u0,
+        is-transferable: is-transferable,
+        transfer-history: (list),
+        current-owner: tx-sender,
+        is-collaborative: false,
+        collaboration-id: none,
+        in-dispute: false,
+        dispute-id: none,
+        allowed-license-types: allowed-license-types,
+        inheritance-beneficiary: none
+      }
+    )
+    
+    ;; Add to creator's assets
+    (map-set creator-assets
+      { creator: tx-sender, index: (get count creator-count) }
+      { asset-id: asset-id }
+    )
+    
+    ;; Update creator's asset count
+    (map-set creator-asset-count
+      { creator: tx-sender }
+      { count: (+ (get count creator-count) u1) }
+    )
+    
+    ;; Increment asset ID
+    (var-set next-asset-id (+ asset-id u1))
+    
+    (ok asset-id)
+  )
+)
+
+;; Create a collaboration for an IP asset
+(define-public (create-collaboration
+  (asset-id uint)
+  (collaborators (list 10 principal))
+  (royalty-splits (list 10 { collaborator: principal, split-percent: uint }))
+  (decision-threshold uint)
+  (collaboration-terms (string-utf8 1000))
+  (agreement-hash (buff 32))
+)
+  (let
+    (
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (collaboration-id (var-get next-collaboration-id))
+    )
+    
+    ;; Check if caller is owner or original creator
+    (asserts! (is-eq tx-sender (get current-owner asset)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Ensure asset is not already collaborative
+    (asserts! (not (get is-collaborative asset)) (err ERR-ALREADY-COLLABORATOR))
+    
+    ;; Validate collaborator list includes the creator
+    (asserts! (is-some (index-of collaborators tx-sender)) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Validate royalty splits add up to 100%
+    (asserts! (is-eq (fold add-royalty-percent royalty-splits u0) u10000) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Create collaboration
+    (map-set collaborations
+      { collaboration-id: collaboration-id }
+      {
+        asset-id: asset-id,
+        creation-date: block-height,
+        last-modified: block-height,
+        collaborators: collaborators,
+        royalty-splits: royalty-splits,
+        decision-threshold: decision-threshold,
+        collaboration-terms: collaboration-terms,
+        agreement-hash: agreement-hash,
+        administrator: tx-sender,
+        is-active: true
+      }
+    )
+    
+    ;; Update asset to mark as collaborative
+    (map-set ip-assets
+      { asset-id: asset-id }
+      (merge asset {
+        is-collaborative: true,
+        collaboration-id: (some collaboration-id)
+      })
+    )
+    
+    ;; Increment collaboration ID
+    (var-set next-collaboration-id (+ collaboration-id u1))
+    
+    (ok collaboration-id)
+  )
+)
