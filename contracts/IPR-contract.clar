@@ -695,3 +695,249 @@
       (asset-id (get asset-id license))
       (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
     )
+ ;; Check if caller is licensor or contract owner
+    (asserts! (or 
+               (is-eq tx-sender (get licensor license))
+               (is-eq tx-sender (var-get contract-owner))
+              ) 
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if license is not already terminated
+    (asserts! (not (is-eq (get status license) LICENSE-STATUS-TERMINATED)) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Update license status
+    (map-set licenses
+      { license-id: license-id }
+      (merge license {
+        status: LICENSE-STATUS-TERMINATED,
+        last-modified: block-height
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Create a sublicense (if allowed by parent license)
+(define-public (create-sublicense
+  (parent-license-id uint)
+  (sublicensee principal)
+  (license-type uint)
+  (license-terms (string-utf8 1000))
+  (royalty-percent uint)
+  (upfront-payment uint)
+  (start-date uint)
+  (end-date (optional uint))
+  (territory (string-utf8 100))
+  (usage-limits (optional uint))
+  (payment-schedule (string-utf8 256))
+  (license-hash (buff 32))
+  (termination-conditions (string-utf8 500))
+)
+  (let
+    (
+      (parent-license (unwrap! (get-license parent-license-id) (err ERR-LICENSE-NOT-FOUND)))
+      (asset-id (get asset-id parent-license))
+      (asset (unwrap! (get-ip-asset asset-id) (err ERR-ASSET-NOT-FOUND)))
+      (license-id (var-get next-license-id))
+    )
+    
+    ;; Check if caller is the licensee of the parent license
+    (asserts! (is-eq tx-sender (get licensee parent-license)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if sublicensing is allowed
+    (asserts! (get is-sublicensable parent-license) (err ERR-INVALID-LICENSE-TERMS))
+    
+    ;; Check if parent license is active
+    (asserts! (is-license-active parent-license-id) (err ERR-LICENSE-NOT-ACTIVE))
+    
+    ;; Check if license type is allowed
+    (asserts! (is-some (index-of (get allowed-license-types asset) license-type)) (err ERR-INVALID-LICENSE-TERMS))
+    
+    ;; Check if royalty percentage is within limits and not lower than parent
+    (asserts! (and
+               (<= royalty-percent (var-get max-royalty-percent))
+               (>= royalty-percent (get royalty-percent parent-license))
+              ) 
+              (err ERR-ROYALTY-EXCEEDS-MAX))
+    
+    ;; Check if end date is not later than parent license end date
+    (match (get end-date parent-license)
+      parent-end
+      (match end-date
+        sub-end (asserts! (<= sub-end parent-end) (err ERR-INVALID-LICENSE-TERMS))
+        true
+      )
+      true
+    )
+    
+    ;; Process upfront payment if any
+    (when (> upfront-payment u0)
+      (try! (stx-transfer? upfront-payment sublicensee tx-sender))
+    )
+    
+    ;; Create the sublicense
+    (map-set licenses
+      { license-id: license-id }
+      {
+        asset-id: asset-id,
+        licensor: tx-sender,
+        licensee: sublicensee,
+        license-type: license-type,
+        license-terms: license-terms,
+        royalty-percent: royalty-percent,
+        upfront-payment: upfront-payment,
+        start-date: start-date,
+        end-date: end-date,
+        territory: territory,
+        usage-limits: usage-limits,
+        usage-count: u0,
+        payment-schedule: payment-schedule,
+        status: LICENSE-STATUS-ACTIVE,
+        creation-date: block-height,
+        last-modified: block-height,
+        license-hash: license-hash,
+        is-sublicensable: false, ;; Typically sublicenses cannot be further sublicensed
+        sublicense-parent: (some parent-license-id),
+        termination-conditions: termination-conditions
+      }
+    )
+    
+    ;; Add to asset's licenses
+    (map-set asset-licenses
+      { asset-id: asset-id, index: (get license-count asset) }
+      { license-id: license-id }
+    )
+    
+    ;; Update asset license count
+    (map-set ip-assets
+      { asset-id: asset-id }
+      (merge asset {
+        license-count: (+ (get license-count asset) u1)
+      })
+    )
+    
+    ;; Add to sublicensee's licenses
+    (let
+      (
+        (licensee-count (default-to { count: u0 } (map-get? licensee-license-count { licensee: sublicensee })))
+      )
+      (map-set licensee-licenses
+        { licensee: sublicensee, index: (get count licensee-count) }
+        { license-id: license-id }
+      )
+      
+      (map-set licensee-license-count
+        { licensee: sublicensee }
+        { count: (+ (get count licensee-count) u1) }
+      )
+    )
+    
+    ;; Initialize royalty payment count
+    (map-set royalty-payment-count
+      { license-id: license-id }
+      { count: u0 }
+    )
+    
+    ;; Increment license ID
+    (var-set next-license-id (+ license-id u1))
+    
+    (ok license-id)
+  )
+)
+
+;; Update platform fee percentage
+(define-public (update-platform-fee (new-fee-percent uint))
+  (begin
+    ;; Only contract owner can update fee
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if fee is reasonable (max 10%)
+    (asserts! (<= new-fee-percent u1000) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Update fee
+    (var-set platform-fee-percent new-fee-percent)
+    
+    (ok true)
+  )
+)
+
+;; Update max royalty percentage
+(define-public (update-max-royalty (new-max-percent uint))
+  (begin
+    ;; Only contract owner can update
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if max is reasonable (max 80%)
+    (asserts! (<= new-max-percent u8000) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Update max royalty
+    (var-set max-royalty-percent new-max-percent)
+    
+    (ok true)
+  )
+)
+
+;; Transfer contract ownership
+(define-public (transfer-ownership (new-owner principal))
+  (begin
+    ;; Only current owner can transfer
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Update owner
+    (var-set contract-owner new-owner)
+    
+    (ok true)
+  )
+)
+
+      (asset-id (var-get next-asset-id))
+      (creator-count (default-to { count: u0 } (map-get? creator-asset-count { creator: tx-sender })))
+    )
+    
+    ;; Validate asset type
+    (asserts! (<= asset-type ASSET-TYPE-OTHER) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Create the asset
+    (map-set ip-assets
+      { asset-id: asset-id }
+      {
+        title: title,
+        description: description,
+        asset-type: asset-type,
+        creator-principal: tx-sender,
+        creation-date: block-height,
+        registration-date: block-height,
+        content-hash: content-hash,
+        metadata-url: metadata-url,
+        license-count: u0,
+        is-transferable: is-transferable,
+        transfer-history: (list),
+        current-owner: tx-sender,
+        is-collaborative: false,
+        collaboration-id: none,
+        in-dispute: false,
+        dispute-id: none,
+        allowed-license-types: allowed-license-types,
+        inheritance-beneficiary: none
+      }
+    )
+    
+    ;; Add to creator's assets
+    (map-set creator-assets
+      { creator: tx-sender, index: (get count creator-count) }
+      { asset-id: asset-id }
+    )
+    
+    ;; Update creator's asset count
+    (map-set creator-asset-count
+      { creator: tx-sender }
+      { count: (+ (get count creator-count) u1) }
+    )
+    
+    ;; Increment asset ID
+    (var-set next-asset-id (+ asset-id u1))
+    
+    (ok asset-id)
+  )
+)
